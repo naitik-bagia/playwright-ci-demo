@@ -1,0 +1,15 @@
+# Expected Failures — web-app
+#
+# List test names (or partial matches) that are known to fail intermittently
+# due to infrastructure flakiness, third-party dependency issues, or tracked
+# bugs that have not yet been fixed.
+#
+# Format: one test name fragment per line.
+# Lines starting with # are comments and are ignored.
+#
+# Example:
+#   todos persist after page reload
+#
+# This list is reviewed and updated during each sprint. Tests listed here
+# are reported to TestRail with status "Expected Failure" instead of "Failed"
+# so they do not block the release dashboard.

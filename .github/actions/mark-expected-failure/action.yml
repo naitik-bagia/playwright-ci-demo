@@ -1,0 +1,68 @@
+name: "Mark Expected Test Failures"
+description: >
+  Post-processes the JUnit XML report for a given package and re-labels
+  known-flaky or intentionally failing tests with a custom TestRail status
+  ("Expected Failure") so they don't pollute the failure count in dashboards.
+
+  A test is considered an expected failure if its name appears in the
+  package's expected-failures.txt allowlist file.
+
+inputs:
+  test-suite:
+    description: "Package name (must match a directory under packages/)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check for expected failures list
+      id: check-list
+      shell: bash
+      run: |
+        ALLOWLIST="packages/${{ inputs.test-suite }}/pw-tests/expected-failures.txt"
+        if [[ -f "$ALLOWLIST" ]]; then
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "allowlist=$ALLOWLIST" >> $GITHUB_OUTPUT
+        else
+          echo "found=false" >> $GITHUB_OUTPUT
+          echo "No expected-failures.txt found for ${{ inputs.test-suite }} — skipping."
+        fi
+
+    - name: Patch JUnit report with expected-failure markers
+      if: steps.check-list.outputs.found == 'true'
+      shell: bash
+      run: |
+        JUNIT_REPORT="packages/${{ inputs.test-suite }}/pw-tests/reports/junit-report.xml"
+        ALLOWLIST="${{ steps.check-list.outputs.allowlist }}"
+
+        if [[ ! -f "$JUNIT_REPORT" ]]; then
+          echo "JUnit report not found at $JUNIT_REPORT — skipping."
+          exit 0
+        fi
+
+        echo "Processing expected failures for ${{ inputs.test-suite }}..."
+
+        # Read each line of the allowlist and mark matching testcase elements
+        while IFS= read -r test_name || [[ -n "$test_name" ]]; do
+          # Skip blank lines and comments
+          [[ -z "$test_name" || "$test_name" == \#* ]] && continue
+
+          # Insert a properties block with custom status marker on matching test cases
+          python3 - <<PYEOF
+        import re, sys
+
+        with open("$JUNIT_REPORT", "r") as f:
+            content = f.read()
+
+        pattern = r'(<testcase[^>]*name="[^"]*${test_name}[^"]*"[^>]*>)'
+        replacement = r'\1\n    <properties><property name="testrail_result_comment" value="Expected Failure - Known issue"/></properties>'
+        patched = re.sub(pattern, replacement, content, flags=re.DOTALL)
+
+        with open("$JUNIT_REPORT", "w") as f:
+            f.write(patched)
+
+        print(f"Marked expected failure: ${test_name}")
+        PYEOF
+        done < "$ALLOWLIST"
+
+        echo "Expected failure marking complete."

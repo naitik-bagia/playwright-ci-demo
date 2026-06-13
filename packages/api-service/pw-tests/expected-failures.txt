@@ -1,0 +1,4 @@
+# Expected Failures — api-service
+#
+# Known intermittent failures for the API service test suite.
+# See web-app/pw-tests/expected-failures.txt for full format documentation.

@@ -1,0 +1,306 @@
+# Playwright Scheduled E2E Run
+#
+# Runs automatically every morning at 06:30 UTC, or can be triggered
+# manually via workflow_dispatch with a choice of test scope.
+#
+# Pipeline overview:
+#   1. initialize_test_plan  — creates a dated TestRail Test Plan via REST API
+#   2. e2e_tests (matrix)    — runs each package in parallel:
+#        a. First run with --grep / --grep-invert tag filter
+#        b. Upload JUnit results to TestRail (creates a Run inside the Plan)
+#        c. Extract the newly-created Test Run ID from the plan
+#        d. Rerun only the previously-failed tests (--last-failed)
+#        e. Upload rerun results to the SAME Run ID (merges pass/fail)
+#        f. Upload HTML report as a GitHub Actions artifact
+#        g. Send a per-package Slack notification with pass/fail counts
+#
+# Required secrets (set in Settings → Secrets → Actions):
+#   TESTRAIL_USERNAME       TestRail user e-mail
+#   TESTRAIL_KEY            TestRail API key
+#   SLACK_WEBHOOK_URL       Slack Incoming Webhook URL
+#   NPM_AUTH_TOKEN          (optional) private npm registry token
+
+name: Playwright Scheduled Run
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # 06:30 UTC daily
+  workflow_dispatch:
+    inputs:
+      testTag:
+        description: "Test scope to execute"
+        default: "@smoke"
+        required: true
+        type: choice
+        options:
+          - "@smoke"
+          - "regression"
+
+env:
+  TESTRAIL_HOST: https://your-org.testrail.io # ← update to your TestRail instance
+  TESTRAIL_PROJECT_NAME: "Playwright Showcase"
+  TESTRAIL_PROJECT_ID: 1 # ← update to your TestRail project ID
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1 — Create a new TestRail Test Plan for this run
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  initialize_test_plan:
+    name: "Create TestRail Test Plan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test_plan_id: ${{ steps.create_test_plan.outputs.test_plan_id }}
+
+    steps:
+      - name: Create Test Plan
+        id: create_test_plan
+        run: |
+          TEST_PLAN_NAME="Scheduled Automation Run — $(date +'%Y-%m-%d')"
+
+          TEST_PLAN_RESPONSE=$(curl -s --fail-with-body -X POST \
+            -H "Content-Type: application/json" \
+            -u "${{ secrets.TESTRAIL_USERNAME }}:${{ secrets.TESTRAIL_KEY }}" \
+            -d '{
+              "name":        "'"$TEST_PLAN_NAME"'",
+              "description": "Automated test plan created by GitHub Actions — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "entries":     []
+            }' \
+            "$TESTRAIL_HOST/index.php?/api/v2/add_plan/$TESTRAIL_PROJECT_ID")
+
+          TEST_PLAN_ID=$(echo "$TEST_PLAN_RESPONSE" | jq -r '.id')
+
+          if [[ "$TEST_PLAN_ID" == "null" || -z "$TEST_PLAN_ID" ]]; then
+            echo "::error::Failed to create TestRail Test Plan."
+            echo "Response: $TEST_PLAN_RESPONSE"
+            exit 1
+          fi
+
+          echo "Created TestRail Test Plan: $TEST_PLAN_ID"
+          echo "test_plan_id=$TEST_PLAN_ID" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2 — E2E tests (runs once per package in the matrix)
+  # ─────────────────────────────────────────────────────────────────────────────
+  e2e_tests:
+    name: "E2E — ${{ matrix.package-name }}"
+    needs: initialize_test_plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60 # Covers first run + retry + upload
+    env:
+      # On a cron trigger always run smoke; on manual use the input value
+      TEST_TAG: ${{ github.event_name == 'schedule' && '@smoke' || github.event.inputs.testTag }}
+
+    strategy:
+      fail-fast: false # Let all packages run even if one fails
+      matrix:
+        package-name:
+          - web-app
+          - api-service
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Environment setup (composite action) ─────────────────────────────
+      - name: Setup Playwright environment
+        uses: ./.github/actions/playwright-setup
+        with:
+          npm-auth-token: ${{ secrets.NPM_AUTH_TOKEN }}
+
+      # ── First test run ────────────────────────────────────────────────────
+      - name: "Run Playwright — ${{ matrix.package-name }} (first pass)"
+        id: first_run
+        run: |
+          if [[ "$TEST_TAG" == "@smoke" ]]; then
+            yarn workspace ${{ matrix.package-name }} run test:e2e:ci \
+              --grep "$TEST_TAG" || exit 0
+          else
+            yarn workspace ${{ matrix.package-name }} run test:e2e:ci \
+              --grep-invert @prd-smoke --workers=2 || exit 0
+          fi
+
+      # ── Mark expected failures in the JUnit report ────────────────────────
+      - name: Mark expected failures
+        uses: ./.github/actions/mark-expected-failure
+        with:
+          test-suite: ${{ matrix.package-name }}
+
+      # ── Upload first-run results to TestRail ──────────────────────────────
+      - name: Upload first-run results to TestRail
+        id: upload_first_run
+        run: |
+          TEST_PLAN_ID="${{ needs.initialize_test_plan.outputs.test_plan_id }}"
+          TEST_RUN_NAME="${{ matrix.package-name }} — $(date +'%Y-%m-%d')"
+
+          pip install trcli --quiet
+
+          trcli -y \
+            -h "$TESTRAIL_HOST" \
+            --project "$TESTRAIL_PROJECT_NAME" \
+            -u "${{ secrets.TESTRAIL_USERNAME }}" \
+            -k "${{ secrets.TESTRAIL_KEY }}" \
+            parse_junit \
+            --case-matcher name \
+            --title          "$TEST_RUN_NAME" \
+            --run-description "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f "packages/${{ matrix.package-name }}/pw-tests/reports/junit-report.xml" \
+            --plan-id "$TEST_PLAN_ID"
+
+      # ── Fetch the Test Run ID that trcli just created ─────────────────────
+      - name: Fetch Test Run ID from TestRail plan
+        id: fetch_run_id
+        run: |
+          PLAN_ID="${{ needs.initialize_test_plan.outputs.test_plan_id }}"
+          PACKAGE_NAME="${{ matrix.package-name }}"
+
+          PLAN_DETAILS=$(curl -s --fail-with-body -X GET \
+            -H "Content-Type: application/json" \
+            -u "${{ secrets.TESTRAIL_USERNAME }}:${{ secrets.TESTRAIL_KEY }}" \
+            "$TESTRAIL_HOST/index.php?/api/v2/get_plan/$PLAN_ID")
+
+          # Find the run whose name contains the package name
+          TEST_RUN_ID=$(echo "$PLAN_DETAILS" \
+            | jq --arg pkg "$PACKAGE_NAME" -r \
+                '.entries[].runs[] | select(.name | test($pkg)) | .id')
+
+          if [[ -z "$TEST_RUN_ID" ]]; then
+            echo "::error::Test Run ID not found for package '$PACKAGE_NAME' in plan $PLAN_ID"
+            exit 1
+          fi
+
+          echo "Test Run ID: $TEST_RUN_ID"
+          echo "TEST_RUN_ID=$TEST_RUN_ID" >> $GITHUB_ENV
+
+      # ── Re-run only the tests that failed in the first pass ───────────────
+      - name: "Rerun failed tests — ${{ matrix.package-name }}"
+        run: |
+          if [[ "$TEST_TAG" == "@smoke" ]]; then
+            yarn workspace ${{ matrix.package-name }} run test:e2e:ci \
+              --grep "$TEST_TAG" --last-failed || exit 0
+          else
+            yarn workspace ${{ matrix.package-name }} run test:e2e:ci \
+              --grep-invert @prd-smoke --workers=2 --last-failed || exit 0
+          fi
+
+      # ── Mark expected failures in the rerun report ────────────────────────
+      - name: Mark expected failures (rerun)
+        uses: ./.github/actions/mark-expected-failure
+        with:
+          test-suite: ${{ matrix.package-name }}
+
+      # ── Upload rerun results to the SAME TestRail run ─────────────────────
+      - name: Upload rerun results to TestRail
+        run: |
+          trcli -n \
+            -h "$TESTRAIL_HOST" \
+            --project "$TESTRAIL_PROJECT_NAME" \
+            -u "${{ secrets.TESTRAIL_USERNAME }}" \
+            -k "${{ secrets.TESTRAIL_KEY }}" \
+            parse_junit \
+            --case-matcher name \
+            --run-description "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f "packages/${{ matrix.package-name }}/pw-tests/reports/junit-report.xml" \
+            --run-id "$TEST_RUN_ID"
+
+      # ── Upload HTML report as a GitHub Actions artifact ───────────────────
+      - name: Upload Playwright HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.package-name }}
+          path: packages/${{ matrix.package-name }}/playwright-report/
+          retention-days: 10
+
+      # ── Fetch final run stats for the Slack message ───────────────────────
+      - name: Fetch final TestRail run stats
+        if: always()
+        id: fetch_run_stats
+        run: |
+          if [[ -n "$TEST_RUN_ID" && "$TEST_RUN_ID" != "null" ]]; then
+            TEST_RUN_DETAILS=$(curl -s --fail-with-body -X GET \
+              -H "Content-Type: application/json" \
+              -u "${{ secrets.TESTRAIL_USERNAME }}:${{ secrets.TESTRAIL_KEY }}" \
+              "$TESTRAIL_HOST/index.php?/api/v2/get_run/$TEST_RUN_ID")
+            echo "TEST_RUN_DETAILS=$TEST_RUN_DETAILS" >> $GITHUB_ENV
+          fi
+
+      # ── Build Slack notification payload ─────────────────────────────────
+      - name: Prepare Slack notification variables
+        if: always()
+        run: |
+          CURRENT_DATE_TIME=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          if [[ -n "$TEST_RUN_ID" && "$TEST_RUN_ID" != "null" && -n "$TEST_RUN_DETAILS" ]]; then
+            PASSED_COUNT=$(echo "$TEST_RUN_DETAILS"           | jq -r '.passed_count')
+            RETEST_COUNT=$(echo "$TEST_RUN_DETAILS"           | jq -r '.retest_count')
+            FAILED_COUNT=$(echo "$TEST_RUN_DETAILS"           | jq -r '.failed_count')
+            EXPECTED_FAILURE_COUNT=$(echo "$TEST_RUN_DETAILS" | jq -r '.custom_status2_count')
+            TESTRAIL_LINK="$TESTRAIL_HOST/index.php?/runs/view/$TEST_RUN_ID"
+            TESTRAIL_TEXT="*TestRail Run:*\n<$TESTRAIL_LINK|View Test Run>"
+            TEST_RESULTS=":white_check_mark: *Passed:* $PASSED_COUNT\n:repeat: *Retest:* $RETEST_COUNT\n:x: *Failed:* $FAILED_COUNT\n:large_orange_diamond: *Expected Failures:* $EXPECTED_FAILURE_COUNT"
+          else
+            TESTRAIL_TEXT=":warning: *Test Run ID not found — the job was not successful.*"
+            TEST_RESULTS="N/A"
+          fi
+
+          if [[ "$TEST_TAG" == "@smoke" ]]; then
+            EXEC_TYPE=":fire: Smoke"
+          else
+            EXEC_TYPE=":mag: Regression"
+          fi
+
+          echo "CURRENT_DATE_TIME=$CURRENT_DATE_TIME"     >> $GITHUB_ENV
+          echo "EXEC_TYPE=$EXEC_TYPE"                      >> $GITHUB_ENV
+          echo "TESTRAIL_TEXT=$TESTRAIL_TEXT"              >> $GITHUB_ENV
+          echo "TEST_RESULTS=$TEST_RESULTS"                >> $GITHUB_ENV
+
+      # ── Send Slack notification ───────────────────────────────────────────
+      - name: Send Slack notification
+        if: always()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: webhook-trigger
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": ":rocket: Playwright Test Execution Report",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Date / Time (UTC):*\n${{ env.CURRENT_DATE_TIME }}" },
+                    { "type": "mrkdwn", "text": "*Package:*\n${{ matrix.package-name }}" },
+                    { "type": "mrkdwn", "text": "*Environment:*\nstaging" },
+                    { "type": "mrkdwn", "text": "*Execution Type:*\n${{ env.EXEC_TYPE }}" }
+                  ]
+                },
+                { "type": "divider" },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "${{ env.TESTRAIL_TEXT }}" },
+                    { "type": "mrkdwn", "text": "${{ env.TEST_RESULTS }}" }
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ":information_source: _Automated Playwright E2E summary. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View CI run>_"
+                    }
+                  ]
+                }
+              ]
+            }

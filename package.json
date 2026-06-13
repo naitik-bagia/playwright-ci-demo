@@ -1,0 +1,23 @@
+{
+  "name": "playwright-ci-testrail-showcase",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sample monorepo showcasing Playwright E2E testing integrated with GitHub Actions CI, TestRail reporting, and Slack notifications.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test:smoke": "yarn workspaces foreach --all -p run test:e2e:ci --grep @smoke",
+    "test:regression": "yarn workspaces foreach --all -p run test:e2e:ci --grep-invert @prd-smoke",
+    "lint": "yarn workspaces foreach --all run lint"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.44.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "yarn": ">=1.22.0"
+  }
+}
