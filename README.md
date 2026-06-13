@@ -31,7 +31,7 @@ playwright-ci-testrail-showcase/
 ├── .github/
 │   ├── actions/
 │   │   ├── playwright-setup/          # Composite: install deps + cache browsers
-│   │   └── xfail-tests/     # Composite: patch JUnit XML with known failures
+│   │   └── xfail-tests/               # Composite: patch JUnit XML with known failures
 │   └── workflows/
 │       ├── playwright-scheduled.yml   # Nightly cron + manual dispatch
 ├── packages/
