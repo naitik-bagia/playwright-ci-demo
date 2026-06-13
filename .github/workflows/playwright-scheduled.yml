@@ -125,7 +125,7 @@ jobs:
 
       # ── Mark expected failures in the JUnit report ────────────────────────
       - name: Mark expected failures
-        uses: ./.github/actions/mark-expected-failure
+        uses: ./.github/actions/xfail-tests
         with:
           test-suite: ${{ matrix.package-name }}
 
@@ -188,7 +188,7 @@ jobs:
 
       # ── Mark expected failures in the rerun report ────────────────────────
       - name: Mark expected failures (rerun)
-        uses: ./.github/actions/mark-expected-failure
+        uses: ./.github/actions/xfail-tests
         with:
           test-suite: ${{ matrix.package-name }}
 

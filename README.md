@@ -17,7 +17,7 @@
 | TestRail Test Plan + Run creation via REST API | `initialize_test_plan` job                     |
 | JUnit XML upload via `trcli`                   | `parse_junit` steps                            |
 | Test Run ID extraction with `jq`               | `fetch_run_id` step                            |
-| Expected failure management                    | `.github/actions/mark-expected-failure`        |
+| Expected failure management                    | `.github/actions/xfail-tests`                  |
 | Composite GitHub Actions                       | `.github/actions/playwright-setup`             |
 | Browser cache across CI runs                   | `actions/cache` in `playwright-setup`          |
 | Slack Block Kit notifications                  | `Send Slack notification` step                 |
@@ -31,10 +31,9 @@ playwright-ci-testrail-showcase/
 ├── .github/
 │   ├── actions/
 │   │   ├── playwright-setup/          # Composite: install deps + cache browsers
-│   │   └── mark-expected-failure/     # Composite: patch JUnit XML with known failures
+│   │   └── xfail-tests/     # Composite: patch JUnit XML with known failures
 │   └── workflows/
 │       ├── playwright-scheduled.yml   # Nightly cron + manual dispatch
-│       └── playwright-pr.yml          # PR smoke gate (path-filtered)
 ├── packages/
 │   ├── web-app/                       # UI tests — Playwright TodoMVC demo
 │   │   └── pw-tests/
@@ -86,7 +85,7 @@ playwright-ci-testrail-showcase/
          │  1. Playwright first run │
          │     (smoke or regression)│
          ├─────────────────────────┤
-         │  2. Mark expected fails  │
+         │  2. Mark known-failures  │
          ├─────────────────────────┤
          │  3. trcli upload → TR   │
          │     Creates Test Run     │
@@ -119,11 +118,11 @@ The [TestRail CLI (`trcli`)](https://github.com/gurock/trcli) parses the JUnit X
 
 ### Expected failure management
 
-Some tests legitimately fail due to known bugs or environmental flakiness. Rather than suppressing them, the `mark-expected-failure` composite action patches the JUnit XML to add a TestRail property that maps to a custom "Expected Failure" status. This keeps the failure count honest while preventing tracked issues from blocking release dashboards.
+Some tests legitimately fail due to known bugs or environmental flakiness. Rather than suppressing them, the `xfail-tests` composite action patches the JUnit XML to add a TestRail property that maps to a custom "Expected Failure" status. This keeps the failure count honest while preventing tracked issues from blocking release dashboards.
 
 ### Composite actions as reusable building blocks
 
-`playwright-setup` and `mark-expected-failure` are composite actions — they can be reused across any workflow in the repository without duplicating logic. `playwright-setup` caches both the `node_modules` tree (via `actions/cache` keyed to `yarn.lock`) and the Playwright browser binaries (keyed to `package.json` hash), cutting average setup time from ~3 minutes to ~20 seconds on cache hits.
+`playwright-setup` and `xfail-tests` are composite actions — they can be reused across any workflow in the repository without duplicating logic. `playwright-setup` caches both the `node_modules` tree (via `actions/cache` keyed to `yarn.lock`) and the Playwright browser binaries (keyed to `package.json` hash), cutting average setup time from ~3 minutes to ~20 seconds on cache hits.
 
 ---
 
